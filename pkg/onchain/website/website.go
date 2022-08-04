@@ -2,21 +2,18 @@ package website
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
-	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/massalabs/thyra/pkg/front"
+	fwallet "github.com/massalabs/thyra/pkg/front/wallet"
+	"github.com/massalabs/thyra/pkg/front/website"
 	"github.com/massalabs/thyra/pkg/node"
 	"github.com/massalabs/thyra/pkg/onchain/storage"
-	"github.com/massalabs/thyra/pkg/wallet"
 )
 
 func Resolve(client *node.Client, name string) (string, error) {
-	//digest := blake3.Sum256([]byte("record" + name))
-	//key := base58.CheckEncode(digest[:])
-
 	address := "A12ew8eiCS7wnY8SkUdwBgDkdD5qwmbJgkJvYLCvVjWWdoFJJLvW"
 
 	const dnsPrefix = "record"
@@ -43,31 +40,81 @@ func Fetch(c *node.Client, addr string, filename string) ([]byte, error) {
 	return m[filename], nil
 }
 
-func handleInitialRequest(w http.ResponseWriter, r *http.Request) {
-	addr := r.URL.Query()["url"][0]
-	rpcClient := node.NewClient("http://145.239.66.206:33035")
-	cookie := &http.Cookie{
-		Name:   "ocw",
-		Value:  addr,
-		MaxAge: 10,
-	}
-	http.SetCookie(w, cookie)
+func removeEmptyStrings(s []string) []string {
+	var r []string
 
-	body, err := Fetch(rpcClient, addr, "index.html")
+	for _, str := range s {
+		if str != "" {
+			r = append(r, str)
+		}
+	}
+
+	return r
+}
+
+func pathNotFound(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotFound)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	_, err := w.Write([]byte("{\"code\":404,\"message\":\"path " + r.URL.Path + " was not found\"}"))
+	if err != nil {
+		panic(err)
+	}
+}
+
+func setContentType(rsc string, w http.ResponseWriter) {
+	switch filepath.Ext(rsc) {
+	case ".css":
+		w.Header().Set("Content-Type", "text/css")
+	case ".js":
+		w.Header().Set("Content-Type", "application/json")
+	case ".html":
+		w.Header().Set("Content-Type", "text/html")
+	case ".webp":
+		w.Header().Set("Content-Type", "text/webp")
+	}
+}
+
+func Request(w http.ResponseWriter, r *http.Request, c *node.Client, address string, resource string) {
+	body, err := Fetch(c, address, resource)
 	if err != nil {
 		panic(err)
 	}
 
-	w.Write(body)
+	setContentType(resource, w)
+
+	_, err = w.Write(body)
+	if err != nil {
+		panic(err)
+	}
 }
 
-func handleMassaDomainRequest(w http.ResponseWriter, r *http.Request) {
-	i := strings.Index(r.Host, ".massa")
-	if i < 0 {
-		panic("no .massa in URL")
+func handleAPIRequest(w http.ResponseWriter, r *http.Request) {
+	prefixSize := len("/website/")
+	if len(r.URL.Path) < prefixSize {
+		pathNotFound(w, r)
+
+		return
 	}
 
-	name := r.Host[:i]
+	splited := removeEmptyStrings(strings.Split(r.URL.Path[prefixSize:], "/"))
+
+	switch len(splited) {
+	// no resource, only an address is present
+	case 1:
+		http.Redirect(w, r, "http://"+r.Host+"/website/"+splited[0]+"/"+"index.html", http.StatusSeeOther)
+	// address and resource are present
+	case 2:
+		c := node.NewClient("http://145.239.66.206:33035")
+		Request(w, r, c, splited[0], splited[1])
+	default:
+		pathNotFound(w, r)
+	}
+}
+
+func handleMassaDomainRequest(w http.ResponseWriter, r *http.Request, index int) {
+	name := r.Host[:index]
 
 	rpcClient := node.NewClient("http://145.239.66.206:33035")
 
@@ -83,76 +130,69 @@ func handleMassaDomainRequest(w http.ResponseWriter, r *http.Request) {
 		target = r.URL.Path[1:]
 	}
 
-	body, err := Fetch(rpcClient, addr, target)
-	if err != nil {
-		panic(err)
-	}
-
-	if strings.Index(target, ".css") > 0 {
-		w.Header().Set("Content-Type", "text/css")
-	} else if strings.Index(target, ".js") > 0 {
-		w.Header().Set("Content-Type", "application/json")
-	} else if strings.Index(target, ".html") > 0 {
-		w.Header().Set("Content-Type", "text/html")
-	}
-
-	_, err = w.Write(body)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func handleSubsequentRequest(w http.ResponseWriter, r *http.Request) {
-	addr, err := r.Cookie("ocw")
-	if err != nil {
-		fmt.Println("Error reading cookie")
-		panic(err)
-	}
-
-	rpcClient := node.NewClient("http://145.239.66.206:33035")
-
-	body, err := Fetch(rpcClient, addr.Value, path.Base(r.URL.Path))
-	if err != nil {
-		panic(err)
-	}
-
-	w.Write(body)
+	Request(w, r, rpcClient, addr, target)
 }
 
 func HandlerFunc(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Index(r.Host, ".massa") > 0 {
-			handleMassaDomainRequest(w, r)
+		massaTLD := strings.Index(r.Host, ".massa")
+
+		if massaTLD > 0 {
+			handleMassaDomainRequest(w, r, massaTLD)
 		} else if strings.HasPrefix(r.URL.Path, "/website") {
-			handleInitialRequest(w, r)
+			handleAPIRequest(w, r)
 		} else if strings.HasPrefix(r.URL.Path, "/webuploader.mythyra.massa") {
 			HandleWebsiteUploaderManagementRequest(w, r)
 		} else if strings.HasPrefix(r.URL.Path, "/wallet.mythyra.massa") {
-			wallet.HandleWalletManagementRequest(w, r)
+			HandleWalletManagementRequest(w, r)
 		} else {
 			handler.ServeHTTP(w, r)
 		}
 	})
 }
 
-//TODO Manage panic(err)
 func HandleWebsiteUploaderManagementRequest(w http.ResponseWriter, r *http.Request) {
+	resource := r.URL.Path[1:]
 
-	target := r.URL.Path[1:]
 	var fileText string
-	if strings.Index(target, ".css") > 0 {
-		fileText = front.WebsiteCss
-		w.Header().Set("Content-Type", "text/css")
-	} else if strings.Index(target, ".js") > 0 {
-		fileText = front.WebsiteJs
-		w.Header().Set("Content-Type", "application/json")
-	} else if strings.Index(target, ".html") > 0 {
-		fileText = front.WebsiteHtml
-		w.Header().Set("Content-Type", "text/html")
-	} else if strings.Index(target, ".webp") > 0 {
-		fileText = front.Logo_massaWebp
-		w.Header().Set("Content-Type", "image/webp")
+
+	switch resource {
+	case "website.css":
+		fileText = website.CSS
+	case "website.js":
+		fileText = website.JS
+	case "website.html":
+		fileText = website.HTML
+	case "logo.webp.css":
+		fileText = front.Logo
 	}
+
+	setContentType(resource, w)
+
+	_, err := w.Write([]byte(fileText))
+	if err != nil {
+		panic(err)
+	}
+}
+
+func HandleWalletManagementRequest(w http.ResponseWriter, r *http.Request) {
+	resource := r.URL.Path[1:]
+
+	var fileText string
+
+	switch resource {
+	case "website.css":
+		fileText = fwallet.CSS
+	case "website.js":
+		fileText = fwallet.JS
+	case "website.html":
+		fileText = fwallet.HTML
+	case "logo.webp.css":
+		fileText = front.Logo
+	}
+
+	setContentType(resource, w)
+
 	_, err := w.Write([]byte(fileText))
 	if err != nil {
 		panic(err)
